@@ -34,6 +34,7 @@ pub(super) struct SendConfig {
     pub cc: Option<Vec<Mailbox>>,
     pub bcc: Option<Vec<Mailbox>>,
     pub html: bool,
+    pub attachments: Vec<Attachment>,
 }
 
 fn create_send_raw_message(config: &SendConfig) -> Result<String, GwsError> {
@@ -48,7 +49,7 @@ fn create_send_raw_message(config: &SendConfig) -> Result<String, GwsError> {
         config.bcc.as_deref(),
     );
 
-    finalize_message(mb, &config.body, config.html)
+    finalize_message(mb, &config.body, config.html, &config.attachments)
 }
 
 fn parse_send_args(matches: &ArgMatches) -> Result<SendConfig, GwsError> {
@@ -66,6 +67,7 @@ fn parse_send_args(matches: &ArgMatches) -> Result<SendConfig, GwsError> {
         cc: parse_optional_mailboxes(matches, "cc"),
         bcc: parse_optional_mailboxes(matches, "bcc"),
         html: matches.get_flag("html"),
+        attachments: parse_attachments(matches)?,
     })
 }
 
@@ -82,7 +84,13 @@ mod tests {
             .arg(Arg::new("from").long("from"))
             .arg(Arg::new("cc").long("cc"))
             .arg(Arg::new("bcc").long("bcc"))
-            .arg(Arg::new("html").long("html").action(ArgAction::SetTrue));
+            .arg(Arg::new("html").long("html").action(ArgAction::SetTrue))
+            .arg(
+                Arg::new("attach")
+                    .long("attach")
+                    .short('a')
+                    .action(ArgAction::Append),
+            );
         cmd.try_get_matches_from(args).unwrap()
     }
 
@@ -226,6 +234,7 @@ mod tests {
             cc: None,
             bcc: None,
             html: true,
+            attachments: vec![],
         };
         let raw = create_send_raw_message(&config).unwrap();
         let decoded = strip_qp_soft_breaks(&raw);
@@ -251,6 +260,7 @@ mod tests {
             cc: None,
             bcc: None,
             html: false,
+            attachments: vec![],
         };
         let raw = create_send_raw_message(&config).unwrap();
 
@@ -272,6 +282,7 @@ mod tests {
             cc: Some(Mailbox::parse_list("carol@example.com")),
             bcc: Some(Mailbox::parse_list("secret@example.com")),
             html: false,
+            attachments: vec![],
         };
         let raw = create_send_raw_message(&config).unwrap();
 
@@ -303,6 +314,7 @@ mod tests {
             cc: None,
             bcc: None,
             html: false,
+            attachments: vec![],
         };
         let raw = create_send_raw_message(&config).unwrap();
 
@@ -324,6 +336,7 @@ mod tests {
             cc: None,
             bcc: None,
             html: false,
+            attachments: vec![],
         };
         let raw = create_send_raw_message(&config).unwrap();
 
@@ -340,6 +353,7 @@ mod tests {
             cc: None,
             bcc: None,
             html: false,
+            attachments: vec![],
         };
         let raw = create_send_raw_message(&config).unwrap();
         let to_header = extract_header(&raw, "To").unwrap();
@@ -359,6 +373,7 @@ mod tests {
             cc: None,
             bcc: None,
             html: false,
+            attachments: vec![],
         };
         let raw = create_send_raw_message(&config).unwrap();
 
@@ -383,6 +398,7 @@ mod tests {
             cc: Some(Mailbox::parse_list("carol@example.com\r\nX-Injected: yes")),
             bcc: None,
             html: false,
+            attachments: vec![],
         };
         let raw = create_send_raw_message(&config).unwrap();
 
@@ -395,5 +411,31 @@ mod tests {
         assert!(extract_header(&raw, "Cc")
             .unwrap()
             .contains("carol@example.com"));
+    }
+
+    #[test]
+    fn test_send_with_attachment_produces_multipart() {
+        let config = SendConfig {
+            to: Mailbox::parse_list("alice@example.com"),
+            subject: "Report".to_string(),
+            body: "See attached".to_string(),
+            from: None,
+            cc: None,
+            bcc: None,
+            html: false,
+            attachments: vec![Attachment {
+                filename: "report.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                data: b"fake pdf".to_vec(),
+            }],
+        };
+        let raw = create_send_raw_message(&config).unwrap();
+
+        assert!(raw.contains("multipart/mixed"));
+        assert!(raw.contains("report.pdf"));
+        assert!(raw.contains("See attached"));
+        assert!(extract_header(&raw, "To")
+            .unwrap()
+            .contains("alice@example.com"));
     }
 }

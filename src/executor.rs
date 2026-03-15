@@ -39,6 +39,26 @@ pub enum AuthMethod {
     None,
 }
 
+/// Source for media upload content.
+///
+/// Two mutually exclusive strategies: upload from a file on disk (for Drive,
+/// Chat, etc.) or from in-memory bytes (for Gmail's constructed RFC 5322
+/// messages). Using an enum makes illegal states (both set, or mismatched
+/// content types) unrepresentable.
+pub enum UploadSource<'a> {
+    /// Stream from a file on disk. Content type is inferred from the file
+    /// extension, overridden by metadata mimeType, or explicitly set.
+    File {
+        path: &'a str,
+        content_type: Option<&'a str>,
+    },
+    /// Upload from in-memory bytes with an explicit content type.
+    Bytes {
+        data: &'a [u8],
+        content_type: &'a str,
+    },
+}
+
 /// Configuration for auto-pagination.
 #[derive(Debug, Clone)]
 pub struct PaginationConfig {
@@ -76,7 +96,7 @@ fn parse_and_validate_inputs(
     method: &RestMethod,
     params_json: Option<&str>,
     body_json: Option<&str>,
-    upload_path: Option<&str>,
+    is_media_upload: bool,
 ) -> Result<ExecutionInput, GwsError> {
     let params: Map<String, Value> = if let Some(p) = params_json {
         serde_json::from_str(p)
@@ -123,8 +143,8 @@ fn parse_and_validate_inputs(
         }
     }
 
-    let (full_url, query_params) = build_url(doc, method, &params, upload_path.is_some())?;
-    let is_upload = upload_path.is_some() && method.supports_media_upload;
+    let (full_url, query_params) = build_url(doc, method, &params, is_media_upload)?;
+    let is_upload = is_media_upload && method.supports_media_upload;
 
     Ok(ExecutionInput {
         params,
@@ -145,8 +165,7 @@ async fn build_http_request(
     auth_method: &AuthMethod,
     page_token: Option<&str>,
     pages_fetched: u32,
-    upload_path: Option<&str>,
-    upload_content_type: Option<&str>,
+    upload: &Option<UploadSource<'_>>,
 ) -> Result<reqwest::RequestBuilder, GwsError> {
     let mut request = match method.http_method.as_str() {
         "GET" => client.get(&input.full_url),
@@ -181,22 +200,29 @@ async fn build_http_request(
     }
 
     if pages_fetched == 0 {
-        if input.is_upload {
-            let upload_path = upload_path.expect("upload_path must be Some when is_upload is true");
-
-            let file_meta = tokio::fs::metadata(upload_path).await.map_err(|e| {
-                GwsError::Validation(format!(
-                    "Failed to get metadata for upload file '{}': {}",
-                    upload_path, e
-                ))
-            })?;
-            let file_size = file_meta.len();
-
+        if let Some(upload_source) = upload {
             request = request.query(&[("uploadType", "multipart")]);
-            let media_mime =
-                resolve_upload_mime(upload_content_type, Some(upload_path), &input.body);
-            let (body, content_type, content_length) =
-                build_multipart_stream(&input.body, upload_path, file_size, &media_mime)?;
+            let (body, content_type, content_length) = match upload_source {
+                UploadSource::Bytes { data, content_type } => {
+                    if content_type.contains('\r') || content_type.contains('\n') {
+                        return Err(GwsError::Validation(
+                            "Upload content type must not contain CR or LF".to_string(),
+                        ));
+                    }
+                    build_multipart_bytes(&input.body, data, content_type)?
+                }
+                UploadSource::File { path, content_type } => {
+                    let file_meta = tokio::fs::metadata(path).await.map_err(|e| {
+                        GwsError::Validation(format!(
+                            "Failed to get metadata for upload file '{}': {}",
+                            path, e
+                        ))
+                    })?;
+                    let file_size = file_meta.len();
+                    let media_mime = resolve_upload_mime(*content_type, Some(path), &input.body);
+                    build_multipart_stream(&input.body, path, file_size, &media_mime)?
+                }
+            };
             request = request.header("Content-Type", content_type);
             request = request.header("Content-Length", content_length);
             request = request.body(body);
@@ -373,8 +399,7 @@ pub async fn execute_method(
     token: Option<&str>,
     auth_method: AuthMethod,
     output_path: Option<&str>,
-    upload_path: Option<&str>,
-    upload_content_type: Option<&str>,
+    upload: Option<UploadSource<'_>>,
     dry_run: bool,
     pagination: &PaginationConfig,
     sanitize_template: Option<&str>,
@@ -382,7 +407,7 @@ pub async fn execute_method(
     output_format: &crate::formatter::OutputFormat,
     capture_output: bool,
 ) -> Result<Option<Value>, GwsError> {
-    let input = parse_and_validate_inputs(doc, method, params_json, body_json, upload_path)?;
+    let input = parse_and_validate_inputs(doc, method, params_json, body_json, upload.is_some())?;
 
     if dry_run {
         let dry_run_info = json!({
@@ -417,8 +442,7 @@ pub async fn execute_method(
             &auth_method,
             page_token.as_deref(),
             pages_fetched,
-            upload_path,
-            upload_content_type,
+            &upload,
         )
         .await?;
 
@@ -884,6 +908,41 @@ fn build_multipart_stream(
         content_type,
         content_length,
     ))
+}
+
+/// Builds a multipart/related body from in-memory bytes.
+///
+/// Used when the upload content is constructed in memory (e.g., a Gmail RFC 5322
+/// message with attachments) rather than read from a file on disk.
+fn build_multipart_bytes(
+    metadata: &Option<Value>,
+    data: &[u8],
+    media_mime: &str,
+) -> Result<(reqwest::Body, String, u64), GwsError> {
+    let boundary = format!("gws_boundary_{:016x}", rand::random::<u64>());
+
+    let metadata_json = match metadata {
+        Some(m) => serde_json::to_string(m).map_err(|e| {
+            GwsError::Validation(format!("Failed to serialize upload metadata: {e}"))
+        })?,
+        None => "{}".to_string(),
+    };
+
+    let preamble = format!(
+        "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata_json}\r\n\
+         --{boundary}\r\nContent-Type: {media_mime}\r\n\r\n"
+    );
+    let postamble = format!("\r\n--{boundary}--\r\n");
+
+    let mut body = Vec::with_capacity(preamble.len() + data.len() + postamble.len());
+    body.extend_from_slice(preamble.as_bytes());
+    body.extend_from_slice(data);
+    body.extend_from_slice(postamble.as_bytes());
+
+    let content_length = body.len() as u64;
+    let content_type = format!("multipart/related; boundary={boundary}");
+
+    Ok((reqwest::Body::from(body), content_type, content_length))
 }
 
 /// Builds a buffered multipart/related body for media upload requests.
@@ -1430,6 +1489,33 @@ mod tests {
             mime, "text/markdown",
             "--upload-content-type overrides metadata for media part"
         );
+    }
+
+    #[test]
+    fn test_build_multipart_bytes_with_metadata() {
+        let metadata = Some(json!({ "threadId": "thread-123" }));
+        let data = b"From: test@example.com\r\nSubject: Test\r\n\r\nBody";
+        let (_, content_type, content_length) =
+            build_multipart_bytes(&metadata, data, "message/rfc822").unwrap();
+
+        assert!(
+            content_type.starts_with("multipart/related; boundary=gws_boundary_"),
+            "content_type should be multipart/related: {content_type}",
+        );
+        // Content-length should cover: preamble + data + postamble
+        assert!(
+            content_length > data.len() as u64,
+            "content_length should exceed raw data size: {content_length}",
+        );
+    }
+
+    #[test]
+    fn test_build_multipart_bytes_without_metadata() {
+        let (_, content_type, content_length) =
+            build_multipart_bytes(&None, b"test body", "message/rfc822").unwrap();
+
+        assert!(content_type.starts_with("multipart/related; boundary="));
+        assert!(content_length > 0);
     }
 
     #[tokio::test]
@@ -1997,7 +2083,6 @@ async fn test_execute_method_dry_run() {
         AuthMethod::None,
         None,
         None,
-        None,
         true, // dry_run
         &pagination,
         None,
@@ -2039,7 +2124,6 @@ async fn test_execute_method_missing_path_param() {
         None,
         None,
         AuthMethod::None,
-        None,
         None,
         None,
         true,
@@ -2218,8 +2302,7 @@ async fn test_post_without_body_sets_content_length_zero() {
         &AuthMethod::None,
         None,
         0,
-        None,
-        None,
+        &None,
     )
     .await
     .unwrap();
@@ -2259,8 +2342,7 @@ async fn test_post_with_body_does_not_add_content_length_zero() {
         &AuthMethod::None,
         None,
         0,
-        None,
-        None,
+        &None,
     )
     .await
     .unwrap();
@@ -2298,8 +2380,7 @@ async fn test_get_does_not_set_content_length_zero() {
         &AuthMethod::None,
         None,
         0,
-        None,
-        None,
+        &None,
     )
     .await
     .unwrap();

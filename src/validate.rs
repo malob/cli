@@ -120,7 +120,7 @@ pub fn validate_safe_dir_path(dir: &str) -> Result<PathBuf, GwsError> {
 
 /// Rejects strings containing null bytes or ASCII control characters
 /// (including DEL, 0x7F).
-fn reject_control_chars(value: &str, flag_name: &str) -> Result<(), GwsError> {
+pub(crate) fn reject_control_chars(value: &str, flag_name: &str) -> Result<(), GwsError> {
     if value.bytes().any(|b| b < 0x20 || b == 0x7F) {
         return Err(GwsError::Validation(format!(
             "{flag_name} contains invalid control characters"

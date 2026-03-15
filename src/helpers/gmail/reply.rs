@@ -98,7 +98,7 @@ pub(super) async fn handle_reply(
         html: config.html,
     };
 
-    let raw = create_reply_raw_message(&envelope, &original)?;
+    let raw = create_reply_raw_message(&envelope, &original, &config.attachments)?;
 
     let auth_token = token.as_ref().map(|(t, _)| t.as_str());
     super::send_raw_email(doc, matches, &raw, Some(&original.thread_id), auth_token).await
@@ -132,6 +132,7 @@ pub(super) struct ReplyConfig {
     pub bcc: Option<Vec<Mailbox>>,
     pub remove: Option<Vec<Mailbox>>,
     pub html: bool,
+    pub attachments: Vec<Attachment>,
 }
 
 async fn fetch_user_email(client: &reqwest::Client, token: &str) -> Result<String, GwsError> {
@@ -296,6 +297,7 @@ fn build_reply_subject(original_subject: &str) -> String {
 fn create_reply_raw_message(
     envelope: &ReplyEnvelope,
     original: &OriginalMessage,
+    attachments: &[Attachment],
 ) -> Result<String, GwsError> {
     let mb = mail_builder::MessageBuilder::new()
         .to(to_mb_address_list(envelope.to))
@@ -311,7 +313,7 @@ fn create_reply_raw_message(
     };
     let body = format!("{}{}{}", envelope.body, separator, quoted);
 
-    finalize_message(mb, body, envelope.html)
+    finalize_message(mb, body, envelope.html, attachments)
 }
 
 fn format_quoted_original(original: &OriginalMessage) -> String {
@@ -385,6 +387,7 @@ fn parse_reply_args(matches: &ArgMatches) -> Result<ReplyConfig, GwsError> {
         bcc: parse_optional_mailboxes(matches, "bcc"),
         remove,
         html: matches.get_flag("html"),
+        attachments: parse_attachments(matches)?,
     })
 }
 
@@ -436,7 +439,7 @@ mod tests {
             body: "My reply",
             html: false,
         };
-        let raw = create_reply_raw_message(&envelope, &original).unwrap();
+        let raw = create_reply_raw_message(&envelope, &original, &[]).unwrap();
 
         let to_header = extract_header(&raw, "To").unwrap();
         assert!(to_header.contains("alice@example.com"));
@@ -482,7 +485,7 @@ mod tests {
             body: "Reply with all headers",
             html: false,
         };
-        let raw = create_reply_raw_message(&envelope, &original).unwrap();
+        let raw = create_reply_raw_message(&envelope, &original, &[]).unwrap();
 
         assert!(extract_header(&raw, "Cc")
             .unwrap()
@@ -613,6 +616,12 @@ mod tests {
             .arg(Arg::new("remove").long("remove"))
             .arg(Arg::new("html").long("html").action(ArgAction::SetTrue))
             .arg(
+                Arg::new("attach")
+                    .short('a')
+                    .long("attach")
+                    .action(ArgAction::Append),
+            )
+            .arg(
                 Arg::new("dry-run")
                     .long("dry-run")
                     .action(ArgAction::SetTrue),
@@ -711,7 +720,13 @@ mod tests {
             .arg(Arg::new("to").long("to"))
             .arg(Arg::new("cc").long("cc"))
             .arg(Arg::new("bcc").long("bcc"))
-            .arg(Arg::new("html").long("html").action(ArgAction::SetTrue));
+            .arg(Arg::new("html").long("html").action(ArgAction::SetTrue))
+            .arg(
+                Arg::new("attach")
+                    .short('a')
+                    .long("attach")
+                    .action(ArgAction::Append),
+            );
         let matches = cmd
             .try_get_matches_from(&["test", "--message-id", "abc", "--body", "hi"])
             .unwrap();
@@ -1176,7 +1191,7 @@ mod tests {
             body: "Adding Dave",
             html: false,
         };
-        let raw = create_reply_raw_message(&envelope, &original).unwrap();
+        let raw = create_reply_raw_message(&envelope, &original, &[]).unwrap();
 
         let to_header = extract_header(&raw, "To").unwrap();
         assert!(to_header.contains("alice@example.com"));
@@ -1232,7 +1247,7 @@ mod tests {
             body: "Hi Bob, nice to meet you!",
             html: false,
         };
-        let raw = create_reply_raw_message(&envelope, &original).unwrap();
+        let raw = create_reply_raw_message(&envelope, &original, &[]).unwrap();
 
         let to_header = extract_header(&raw, "To").unwrap();
         assert!(to_header.contains("bob@example.com"));
@@ -1321,7 +1336,7 @@ mod tests {
             body: "<p>My HTML reply</p>",
             html: true,
         };
-        let raw = create_reply_raw_message(&envelope, &original).unwrap();
+        let raw = create_reply_raw_message(&envelope, &original, &[]).unwrap();
         let decoded = strip_qp_soft_breaks(&raw);
 
         assert!(decoded.contains("text/html"));
@@ -1331,5 +1346,46 @@ mod tests {
         assert!(decoded.contains("<p>My HTML reply</p>"));
         assert!(decoded.contains("gmail_quote"));
         assert!(decoded.contains("<p>Original</p>"));
+    }
+
+    #[test]
+    fn test_create_reply_raw_message_with_attachment() {
+        let original = OriginalMessage {
+            thread_id: "t1".to_string(),
+            message_id: "abc@example.com".to_string(),
+            from: Mailbox::parse("alice@example.com"),
+            to: vec![Mailbox::parse("bob@example.com")],
+            subject: "Hello".to_string(),
+            date: Some("Mon, 1 Jan 2026 00:00:00 +0000".to_string()),
+            body_text: "Original body".to_string(),
+            ..Default::default()
+        };
+
+        let refs = build_references_chain(&original);
+        let to = vec![Mailbox::parse("alice@example.com")];
+        let envelope = ReplyEnvelope {
+            to: &to,
+            cc: None,
+            bcc: None,
+            from: None,
+            subject: "Re: Hello",
+            threading: ThreadingHeaders {
+                in_reply_to: &original.message_id,
+                references: &refs,
+            },
+            body: "See attached notes",
+            html: false,
+        };
+        let attachments = vec![Attachment {
+            filename: "notes.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            data: b"some notes".to_vec(),
+        }];
+        let raw = create_reply_raw_message(&envelope, &original, &attachments).unwrap();
+
+        assert!(raw.contains("multipart/mixed"));
+        assert!(raw.contains("notes.txt"));
+        assert!(raw.contains("See attached notes"));
+        assert!(raw.contains("> Original body"));
     }
 }
